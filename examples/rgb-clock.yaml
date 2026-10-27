@@ -1,0 +1,245 @@
+# CAI-274 RGB LED clock kit driven by an ESP32-S3 through the empty MCU footprint (U3). See the README.
+esphome:
+  name: rgb-clock
+  friendly_name: RGB Clock
+  on_boot:
+    priority: -100
+    then:
+      # A restored number does not fire its set_action: push the restored brightness once.
+      - lambda: 'id(tm).brightness((uint8_t) id(bright).state);'
+
+esp32:
+  variant: esp32s3
+  # No flash_size here: on the tested N16R8 board, `flash_size: 16MB` boot-looped (rst:0x3 about every second).
+  framework:
+    type: esp-idf
+
+preferences:
+  flash_write_interval: 5s
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+  # or straight from GitHub:
+  # - source: github://pantgr/esphome-tm1640-rgb-clock
+  #   components: [tm1640rgb]
+
+logger:
+  # UART0 = the CH343 USB-C on most S3 DevKitC clones (the S3's own USB is the other USB-C).
+  hardware_uart: UART0
+  level: DEBUG
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: RGB Clock Fallback Hotspot
+    password: !secret fallback_password
+
+captive_portal:
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+api:
+  reboot_timeout: 0s  # keep running when Home Assistant is down
+  encryption:
+    key: !secret api_key
+
+tm1640rgb:
+  id: tm
+  clk_pin: GPIO4  # through the level shifter to U3 pin 1 = TM1640B SCLK
+  dio_pin: GPIO5  # through the level shifter to U3 pin 2 = TM1640B DIN
+  half_bit_us: 1
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Athens  # yours
+    servers:
+      - 0.pool.ntp.org
+      - 1.pool.ntp.org
+
+light:
+  # The DevKitC's onboard WS2812 (GPIO48, «RGB» solder jumper). Optional.
+  - platform: esp32_rmt_led_strip
+    id: board_rgb
+    name: board rgb
+    restore_mode: RESTORE_DEFAULT_ON
+    on_state:
+      - lambda: |-
+          auto &v = id(board_rgb).remote_values;
+          if (v.is_on() && v.get_brightness() == 0.0f) id(board_rgb).turn_off().perform();
+    pin: GPIO48
+    num_leds: 1
+    chipset: ws2812
+    channel_colors: GRB
+    effects:
+      - addressable_rainbow:
+          speed: 3
+
+# Temperature for the small display, sent by another ESP over ESP-NOW (format in the README).
+# No sender? Remove this block and the globals; the small display stays dark.
+globals:
+  - id: temp_val
+    type: int
+    initial_value: '0'
+  - id: temp_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: temp_ok
+    type: bool
+    initial_value: 'false'
+
+espnow:
+  peers:
+    - AA:BB:CC:DD:EE:FF  # the sender's MAC
+  on_receive:
+    - address: AA:BB:CC:DD:EE:FF
+      then:
+        - lambda: |-
+            if (size >= 5 && data[2] == 0x54) {
+              id(temp_val) = (int16_t) (data[3] | (data[4] << 8));
+              id(temp_ms) = millis();
+              id(temp_ok) = true;
+            }
+
+number:
+  - platform: template
+    id: bright
+    name: brightness
+    min_value: 0
+    max_value: 7
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 3
+    mode: box
+    set_action:
+      - lambda: 'id(tm).brightness((uint8_t) x);'
+  - platform: template
+    id: cycle_s
+    name: cycle seconds
+    min_value: 1
+    max_value: 600
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 10
+    mode: box
+  - platform: template
+    id: seg_step
+    name: step ms
+    min_value: 50
+    max_value: 2000
+    step: 10
+    optimistic: true
+    restore_value: true
+    initial_value: 200
+    mode: box
+
+select:
+  - platform: template
+    id: colour
+    name: colour
+    optimistic: true
+    restore_value: true
+    options:
+      - "red"
+      - "green"
+      - "blue"
+      - "yellow"
+      - "cyan"
+      - "magenta"
+      - "white"
+      - "wave"
+      - "ring"
+      - "rows"
+      - "sweep"
+      - "confetti"
+    initial_option: "wave"
+
+interval:
+  - interval: 50ms
+    then:
+      - lambda: |-
+          static const uint8_t F[10] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
+          static const uint8_t FIXED[7][3] = {{255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {255, 255, 0},
+                                              {0, 255, 255}, {255, 0, 255}, {255, 255, 255}};
+          // Rainbow order red, yellow, green, cyan, blue, magenta as RGB bits.
+          static const uint8_t HUE[6] = {1, 3, 2, 6, 4, 5};
+          static const uint32_t LAG[4] = {0, 0, 400, 800};
+          // Segment effects (bit0..7 = a..g, mark): each segment's place around the digit (a..f clockwise), in rows
+          // top to bottom, in columns left to right inside the digit (the colon has its own column, between 2 and 3).
+          static const uint8_t RING[8] = {0, 1, 2, 3, 4, 5, 3, 0};
+          static const uint8_t ROW[8] = {0, 1, 3, 4, 3, 1, 2, 1};
+          static const uint8_t COL[8] = {1, 2, 2, 1, 0, 0, 1, 0};
+          static uint32_t conf_step = UINT32_MAX;
+          static uint8_t conf[4][8] = {};
+          uint32_t now = millis();
+          uint8_t g[4];
+          auto t = id(sntp_time).now();
+          if (t.is_valid()) {
+            g[0] = F[t.hour / 10];
+            g[1] = F[t.hour % 10];
+            g[2] = F[t.minute / 10];
+            g[3] = F[t.minute % 10];
+            if ((now / 500) % 2 == 0) { g[0] |= 0x80; g[1] |= 0x80; }
+          } else {
+            g[0] = g[1] = g[2] = g[3] = 0x40;
+          }
+          auto idx = id(colour).active_index();
+          int mode = idx.has_value() ? (int) *idx : 0;
+          uint32_t per = (uint32_t) id(cycle_s).state * 1000;
+          if (per < 1000) per = 1000;
+          uint32_t sp = (uint32_t) id(seg_step).state;
+          if (sp < 50) sp = 50;
+          uint32_t step = now / sp;
+          if (mode == 11 && step != conf_step) {
+            conf_step = step;
+            for (auto &digit : conf)
+              for (auto &h : digit) h = random_uint32() % 6;
+          }
+          for (int d = 0; d < 4; d++) {
+            if (mode >= 8) {
+              // One hard colour per lit segment, from its place in the pattern; the pattern moves one place a step.
+              uint8_t m[3] = {0, 0, 0};
+              for (int s = 0; s < 8; s++) {
+                if (!(g[d] & (1 << s))) continue;
+                uint32_t pos;
+                if (mode == 8) pos = RING[s];
+                else if (mode == 9) pos = (s == 7 && d == 1) ? 3 : ROW[s];
+                else pos = s == 7 ? 6 : 3 * d + (d >= 2 ? 1 : 0) + COL[s];
+                uint8_t h = mode == 11 ? HUE[conf[d][s]] : HUE[(step + 600 - pos) % 6];
+                for (int k = 0; k < 3; k++)
+                  if ((h >> k) & 1) m[k] |= 1 << s;
+              }
+              id(tm).set_digit_rgb(d, m[0], m[1], m[2]);
+              continue;
+            }
+            uint8_t c[3];
+            if (mode >= 0 && mode < 7) {
+              for (int k = 0; k < 3; k++) c[k] = FIXED[mode][k];
+            } else {
+              // wave: one hard colour per digit, running across the face (digits 1+2 together, then 3, then 4).
+              uint32_t i = ((now + 6 * per - LAG[d]) / per) % 6;
+              for (int k = 0; k < 3; k++) c[k] = (HUE[i] >> k) & 1 ? 255 : 0;
+            }
+            id(tm).set_digit(d, g[d], c[0], c[1], c[2]);
+          }
+          // Small display: whole degrees 0..199 + the C mark; dark without a reading for 10 min.
+          uint8_t s0 = 0, s1 = 0, s2 = 0;
+          if (id(temp_ok) && now - id(temp_ms) < 600000) {
+            int v = (id(temp_val) + 5) / 10;
+            if (v >= 0 && v <= 199) {
+              if (v >= 100) s0 |= 0x03;
+              if (v >= 10) s1 = F[(v / 10) % 10];
+              s2 = F[v % 10];
+              s0 |= 0x08;
+            }
+          }
+          id(tm).set_small(0, s0);
+          id(tm).set_small(1, s1);
+          id(tm).set_small(2, s2);
